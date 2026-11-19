@@ -1,101 +1,133 @@
 //+------------------------------------------------------------------+
-//|                                        FBK_MultiTimeframe_EA.mq5 |
-//|               Conservative multi-symbol trend/pullback EA        |
+//|                                         FBK_MultiTimeframe_EA.mq5|
+//| Conservative EMA pullback EA with persistent account safeguards  |
 //+------------------------------------------------------------------+
-#property copyright ""
-#property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <Trade/Trade.mqh>
 
-input group "Trading Symbols"
-input bool   InpAllChartSymbols = true;       // true: trade each chart symbol where attached
-input string InpSymbols         = "EURUSD,GBPUSD,USDJPY";
-input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;
+input group "Universe"
+input bool            InpMarketWatchSymbols = false; // true: scan symbols in Market Watch
+input string          InpSymbols             = "EURUSD,GBPUSD,USDJPY"; // broker symbol names, if not using Market Watch
+input ENUM_TIMEFRAMES InpTimeframe           = PERIOD_CURRENT; // chart timeframe by default
 
 input group "Strategy"
-input int    InpFastEMA   = 50;
-input int    InpSlowEMA   = 200;
-input int    InpATRPeriod = 14;
-input double InpATRStop   = 2.0;
-input double InpATRTP     = 3.0;
-input int    InpSlippage  = 20;
-input ulong  InpMagic     = 260519;
+input int      InpFastEMA       = 50;
+input int      InpSlowEMA       = 200;
+input int      InpATRPeriod     = 14;
+input double   InpATRStop       = 2.0;
+input double   InpATRTakeProfit = 3.0;
+input int      InpSlippagePoints = 20;
+input ulong    InpMagic         = 260519;
 
-input group "Risk"
+input group "Risk limits"
 input double InpRiskPerTradePercent = 0.25;
 input double InpDailyLossPercent    = 1.0;
 input double InpMaxDrawdownPercent  = 5.0;
 input int    InpMaxOpenPositions    = 3;
-input double InpMaxSymbolExposurePct = 2.0;
+input int    InpMaxSpreadPoints     = 30; // 0 disables spread filter
+input double InpMaxLots             = 5.0; // additional hard volume cap
 
-input group "Live Safety"
-input bool   InpAllowLiveTrading = false;
-input bool   InpRequireNewBar    = true;
-input int    InpSpreadLimitPoints = 30;
+input group "Live safety"
+input bool InpAllowLiveTrading = false; // must be deliberately enabled for real accounts
 
 CTrade trade;
-datetime barTime[];
-double dayStartEquity = 0.0;
-MqlDateTime dayNow;
-int priorDay = -1;
+string g_symbols[];
+string g_statePrefix;
+string g_dayKey;
+datetime g_lastBar[];
+bool g_riskLocked = false;
 
-int OnInit() {
+int OnInit()
+{
+   if(InpFastEMA < 2 || InpSlowEMA <= InpFastEMA || InpATRPeriod < 2 ||
+      InpATRStop <= 0.0 || InpATRTakeProfit <= 0.0 ||
+      InpRiskPerTradePercent <= 0.0 || InpRiskPerTradePercent > 1.0 ||
+      InpDailyLossPercent <= 0.0 || InpDailyLossPercent > 20.0 ||
+      InpMaxDrawdownPercent <= 0.0 || InpMaxDrawdownPercent > 50.0 ||
+      InpMaxOpenPositions < 1 || InpMaxLots <= 0.0)
+   {
+      Print("Invalid inputs. Risk per trade must be >0 and <=1%; review all limits.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    trade.SetExpertMagicNumber(InpMagic);
-   trade.SetDeviationInPoints(InpSlippage);
-   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetDeviationInPoints(InpSlippagePoints);
    trade.SetAsyncMode(false);
 
-   dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   TimeToStruct(TimeTradeServer(), dayNow);
-   priorDay = dayNow.day;
+   g_statePrefix = StringFormat("FBEA_%I64d_%I64u", AccountInfoInteger(ACCOUNT_LOGIN), InpMagic);
+   if(!BuildSymbolList()) return INIT_FAILED;
+   ArrayResize(g_lastBar, ArraySize(g_symbols));
+   ArrayInitialize(g_lastBar, 0);
+   RefreshDailyBaseline();
+   UpdateEquityPeak();
 
-   Print("EA initialized. Live trading is ", InpAllowLiveTrading ? "ALLOWED" : "BLOCKED");
-   return(INIT_SUCCEEDED);
+   Print("EA initialized; timeframe=", EnumToString(EffectiveTimeframe()),
+         ", symbols=", ArraySize(g_symbols),
+         ", real-account trading=", InpAllowLiveTrading ? "enabled by input" : "blocked");
+   return INIT_SUCCEEDED;
 }
 
-void OnDeinit(const int reason) {}
+void OnTick()
+{
+   if(!TradingEnvironmentAllowed()) return;
+   RefreshDailyBaseline();
+   UpdateEquityPeak();
+   if(CheckRiskLocks()) return;
 
-void OnTick() {
-   if (!terminalAlive()) return;
-
-   MqlDateTime now;
-   TimeToStruct(TimeTradeServer(), now);
-   if (now.day != priorDay) {
-      priorDay = now.day;
-      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   for(int i = 0; i < ArraySize(g_symbols); ++i)
+   {
+      if(CheckRiskLocks()) return;
+      ProcessSymbol(i);
    }
-
-   if (riskKillSwitch()) return;
-
-   if (ArraySize(barTime) < 1) ArrayResize(barTime, 1);
-
-   string symbols[];
-   buildSymbolList(symbols);
-
-   for (int i = 0; i < ArraySize(symbols); i++) {
-      if (riskKillSwitch()) break;
-      processSymbol(symbols[i]);
-   }
-
-   manageOpenPositions();
 }
 
-bool terminalAlive() {
-   if (!TerminalInfoInteger(TERMINAL_CONNECTED)) return false;
-   if (!MQLInfoInteger(MQL_TRADE_ALLOWED)) return false;
+ENUM_TIMEFRAMES EffectiveTimeframe()
+{
+   return InpTimeframe == PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
+}
 
-   if ((bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == false) return false;
-   if ((bool)AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == false) return false;
+bool BuildSymbolList()
+{
+   if(InpMarketWatchSymbols)
+   {
+      int total = SymbolsTotal(true);
+      if(total <= 0) { Print("Market Watch has no symbols."); return false; }
+      ArrayResize(g_symbols, total);
+      for(int i = 0; i < total; ++i) g_symbols[i] = SymbolName(i, true);
+      return true;
+   }
 
-   if (MQLInfoInteger(MQL_TESTER)) return true;
+   string entries[];
+   int count = StringSplit(InpSymbols, ',', entries);
+   if(count <= 0) { Print("InpSymbols is empty."); return false; }
+   ArrayResize(g_symbols, 0);
+   for(int i = 0; i < count; ++i)
+   {
+      StringTrimLeft(entries[i]);
+      StringTrimRight(entries[i]);
+      if(entries[i] == "") continue;
+      int n = ArraySize(g_symbols);
+      ArrayResize(g_symbols, n + 1);
+      g_symbols[n] = entries[i];
+   }
+   return ArraySize(g_symbols) > 0;
+}
 
-   ENUM_ACCOUNT_TRADE_MODE mode = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
-   if (mode == ACCOUNT_TRADE_MODE_REAL && !InpAllowLiveTrading) {
+bool TradingEnvironmentAllowed()
+{
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return false;
+
+   if(!MQLInfoInteger(MQL_TESTER) &&
+      AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_REAL && !InpAllowLiveTrading)
+   {
       static datetime lastWarning = 0;
-      if (TimeCurrent() - lastWarning > 60) {
-         Print("LIVE TRADING BLOCKED: set InpAllowLiveTrading=true only after testing.");
+      if(TimeCurrent() - lastWarning > 60)
+      {
+         Print("Real-account trading blocked. Keep disabled until validated; explicit opt-in is required.");
          lastWarning = TimeCurrent();
       }
       return false;
@@ -103,176 +135,94 @@ bool terminalAlive() {
    return true;
 }
 
-void buildSymbolList(string &symbols[]) {
-   if (InpAllChartSymbols) {
-      ArrayResize(symbols, 1);
-      symbols[0] = _Symbol;
-      return;
-   }
-
-   string parts[];
-   int count = StringSplit(InpSymbols, ',', parts);
-   ArrayResize(symbols, count);
-   for (int i = 0; i < count; i++) {
-      symbols[i] = Trim(parts[i]);
-   }
+string ServerDate()
+{
+   MqlDateTime t;
+   TimeToStruct(TimeTradeServer(), t);
+   return StringFormat("%04d%02d%02d", t.year, t.mon, t.day);
 }
 
-string Trim(string text) {
-   StringTrimLeft(text);
-   StringTrimRight(text);
-   return text;
+void RefreshDailyBaseline()
+{
+   string date = ServerDate();
+   string dateVar = g_statePrefix + "_DATE";
+   string equityVar = g_statePrefix + "_DAYEQ";
+   string lockVar = g_statePrefix + "_DAYLOCK";
+   if(!GlobalVariableCheck(dateVar) || (long)GlobalVariableGet(dateVar) != (long)StringToInteger(date))
+   {
+      GlobalVariableSet(dateVar, (double)StringToInteger(date));
+      GlobalVariableSet(equityVar, AccountInfoDouble(ACCOUNT_EQUITY));
+      GlobalVariableSet(lockVar, 0.0);
+   }
+   g_dayKey = date;
 }
 
-bool riskKillSwitch() {
+void UpdateEquityPeak()
+{
+   string peakVar = g_statePrefix + "_PEAK";
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(!GlobalVariableCheck(peakVar)) GlobalVariableSet(peakVar, equity);
+   else if(equity > GlobalVariableGet(peakVar)) GlobalVariableSet(peakVar, equity);
+}
 
-   if (dayStartEquity > 0) {
-      double dailyLoss = (dayStartEquity - equity) / dayStartEquity * 100.0;
-      if (dailyLoss >= InpDailyLossPercent) {
-         PrintFormat("Kill switch: daily loss %.2f%% reached", dailyLoss);
-         return true;
-      }
+bool CheckRiskLocks()
+{
+   string dayLock = g_statePrefix + "_DAYLOCK";
+   if(GlobalVariableCheck(dayLock) && GlobalVariableGet(dayLock) > 0.5)
+   {
+      g_riskLocked = true;
+      return true;
    }
 
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double peak = MathMax(balance, equity);
-   if (peak > 0) {
-      double drawdown = (peak - equity) / peak * 100.0;
-      if (drawdown >= InpMaxDrawdownPercent) {
-         PrintFormat("Kill switch: drawdown %.2f%% reached", drawdown);
-         return true;
-      }
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dayStart = GlobalVariableGet(g_statePrefix + "_DAYEQ");
+   if(dayStart > 0.0 && (dayStart - equity) / dayStart * 100.0 >= InpDailyLossPercent)
+   {
+      GlobalVariableSet(dayLock, 1.0);
+      g_riskLocked = true;
+      Print("Daily loss limit reached; entries locked until next broker-server day.");
+      return true;
    }
 
-   if (countMyPositions() >= InpMaxOpenPositions) return true;
+   double peak = GlobalVariableGet(g_statePrefix + "_PEAK");
+   if(peak > 0.0 && (peak - equity) / peak * 100.0 >= InpMaxDrawdownPercent)
+   {
+      g_riskLocked = true;
+      Print("Maximum equity drawdown reached; new entries are locked. Restarting will not reset the stored peak.");
+      return true;
+   }
+
+   if(CountMyPositions() >= InpMaxOpenPositions) return true;
    return false;
 }
 
-int countMyPositions() {
+int CountMyPositions()
+{
    int count = 0;
-   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
       ulong ticket = PositionGetTicket(i);
-      if (ticket == 0) continue;
-      if (PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
-      count++;
+      if(ticket != 0 && PositionGetInteger(POSITION_MAGIC) == (long)InpMagic) ++count;
    }
    return count;
 }
 
-void processSymbol(const string symbol) {
-   if (symbol == "") return;
-   if (!SymbolSelect(symbol, true)) return;
-
-   ENUM_SYMBOL_TRADE_MODE tradeMode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE);
-   if (tradeMode == SYMBOL_TRADE_MODE_DISABLED) return;
-
-   long spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
-   if (InpSpreadLimitPoints > 0 && spread > InpSpreadLimitPoints) return;
-
-   if (hasPosition(symbol)) return;
-
-   datetime currentBar = iTime(symbol, InpTimeframe, 0);
-   if (InpRequireNewBar) {
-      static string lastSymbol[];
-      static datetime lastBar[];
-      int n = ArraySize(lastSymbol);
-      int k = -1;
-      for (int i = 0; i < n; i++) if (lastSymbol[i] == symbol) k = i;
-      if (k < 0) {
-         k = n;
-         ArrayResize(lastSymbol, k + 1);
-         ArrayResize(lastBar, k + 1);
-         lastSymbol[k] = symbol;
-         lastBar[k] = 0;
-      }
-      if (lastBar[k] == currentBar) return;
-      lastBar[k] = currentBar;
-   }
-
-   double fast[], slow[], atr[];
-   ArraySetAsSeries(fast, true);
-   ArraySetAsSeries(slow, true);
-   ArraySetAsSeries(atr, true);
-
-   int hFast = iMA(symbol, InpTimeframe, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   int hSlow = iMA(symbol, InpTimeframe, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   int hATR  = iATR(symbol, InpTimeframe, InpATRPeriod);
-   if (hFast == INVALID_HANDLE || hSlow == INVALID_HANDLE || hATR == INVALID_HANDLE) return;
-
-   if (CopyBuffer(hFast, 0, 0, 3, fast) != 3) return;
-   if (CopyBuffer(hSlow, 0, 0, 3, slow) != 3) return;
-   if (CopyBuffer(hATR, 0, 0, 3, atr) != 3) return;
-
-   IndicatorRelease(hFast);
-   IndicatorRelease(hSlow);
-   IndicatorRelease(hATR);
-
-   double close1 = iClose(symbol, InpTimeframe, 1);
-   double atrValue = atr[1];
-   if (close1 <= 0 || atrValue <= 0) return;
-
-   bool bullish = fast[1] > slow[1] && fast[2] <= slow[2];
-   bool bearish = fast[1] < slow[1] && fast[2] >= slow[2];
-
-   if (!bullish && !bearish) return;
-
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-   if (bullish) {
-      double sl = NormalizeDouble(ask - atrValue * InpATRStop, digits);
-      double tp = NormalizeDouble(ask + atrValue * InpATRTP, digits);
-      double lots = calculateLots(symbol, ask - sl);
-      if (lots > 0) trade.Buy(lots, symbol, ask, sl, tp, "Trend pullback buy");
-   } else {
-      double sl = NormalizeDouble(bid + atrValue * InpATRStop, digits);
-      double tp = NormalizeDouble(bid - atrValue * InpATRTP, digits);
-      double lots = calculateLots(symbol, sl - bid);
-      if (lots > 0) trade.Sell(lots, symbol, bid, sl, tp, "Trend pullback sell");
-   }
-}
-
-bool hasPosition(const string symbol) {
-   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+bool AnyPositionOnSymbol(const string symbol)
+{
+   // Avoid modifying/netting with a manual or other-EA position on the same symbol.
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
       ulong ticket = PositionGetTicket(i);
-      if (ticket == 0) continue;
-      if (PositionGetString(POSITION_SYMBOL) != symbol) continue;
-      if (PositionGetInteger(POSITION_MAGIC) == (long)InpMagic) return true;
+      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == symbol) return true;
    }
    return false;
 }
 
-double calculateLots(const string symbol, double stopDistance) {
-   if (stopDistance <= 0) return 0.0;
-
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = equity * InpRiskPerTradePercent / 100.0;
-
-   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-   double volumeStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-   double volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-
-   if (tickValue <= 0 || tickSize <= 0 || volumeStep <= 0) return 0.0;
-
-   double lot = riskMoney / (stopDistance / tickSize * tickValue);
-   lot = MathFloor(lot / volumeStep) * volumeStep;
-
-   lot = MathMax(volMin, MathMin(volMax, lot));
-
-   double positionNotionalPct = lot * SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE)
-                              / equity * 100.0;
-   if (positionNotionalPct > InpMaxSymbolExposurePct) {
-      lot = 0.0;
-   }
-   return NormalizeDouble(lot, 2);
+void ProcessSymbol(const int index)
+{
+   string symbol = g_symbols[index];
+   if(!SymbolSelect(symbol, true)) return;
+   if(SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE) == SYMBOL trade_mode_disabled) return;
 }
 
-void manageOpenPositions() {
-   // Reserved for future broker-specific trailing and exit rules.
-}
 //+------------------------------------------------------------------+
