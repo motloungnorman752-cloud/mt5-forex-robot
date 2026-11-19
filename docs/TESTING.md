@@ -1,41 +1,45 @@
 # Testing Procedure
 
-The EA has not been compiled or tested in MetaTrader in this repository authoring environment. Complete these steps locally before use.
+This EA has not been compiled or executed in MetaTrader in this repository authoring environment. The following checks are mandatory before use.
 
-## 1. Compile
+## Compile
 
-- Copy `src/FBK_MultiTimeframe_EA.mq5` into MT5 `MQL5/Experts/`.
+- Copy the source to `MQL5/Experts/`.
 - Open it in MetaEditor and compile.
-- Resolve compiler warnings/errors and verify the actual input names/defaults.
+- Verify no errors and review warnings.
+- Confirm input names, compiler build, and exact broker symbol behavior.
 
-## 2. Strategy Tester
+## Strategy Tester
 
-Use the intended FBK/RocketX server and test broker-realistic conditions:
+Use an exact broker symbol and account type. Configure:
 
-- exact broker symbol names and account type
 - real ticks where available
-- spread, commission, swap, and slippage assumptions
-- multiple market regimes, including volatile periods
-- at least one out-of-sample period and walk-forward test
+- realistic spread and commission
+- swap and slippage
+- sufficient historical depth
+- normal and volatile periods
+- out-of-sample and walk-forward testing
 
-Review maximum equity drawdown, number of trades, expectancy, profit factor, costs, order rejections, and per-symbol/timeframe outcomes. Avoid optimizing parameters against the entire test period.
+Evaluate maximum equity drawdown, profit factor, expectancy, trade count, realized costs, per-symbol results, and order rejections. Do not optimize against only the best historical period.
 
-## 3. Validate safeguards
+## Safety validation on demo
 
-On demo/tester, verify:
+Verify:
 
-- no entries while real-account opt-in is false
-- daily loss lock persists after EA/terminal restart and resets only on the next server day
-- equity drawdown lock uses the persisted peak
-- no order if min volume exceeds calculated risk
-- spread and position-count limits
-- symbols with suffixes and unavailable symbols fail safely
-- no duplicate or conflicting orders on symbols with existing positions
+- real-account mode blocks entries when `InpAllowLiveTrading=false`
+- the new-bar check prevents duplicate signals
+- existing positions block additional entries on the same symbol
+- spread and position-count limits work
+- broker suffixes and unavailable symbols fail safely
+- stop/target levels meet broker stop-level rules
+- minimum volume behavior skips trades that exceed the risk budget
+- the daily lock persists after restart and resets on the next broker-server day
+- the equity peak persists through terminal restart
 
-## 4. Demo forward test
+## Forward test
 
-Run for at least 30–60 calendar days, across intended symbols and timeframes. Monitor logs and compare planned risk with realized results. Test disconnections/restarts and inspect Global Variables.
+Run on demo for at least 30–60 calendar days across the intended symbols and timeframe. Monitor execution rejects, VPS restarts, Global Variables, margin, disconnections, and realized vs. planned risk.
 
-## 5. Live use
+## Live use
 
-No live use is recommended until compile, backtest, and demo checks pass and you understand the risk. The default blocks real-account trading. Enabling `InpAllowLiveTrading=true` is a deliberate user action and does not mean the EA is verified or safe for deployment. Start with minimum size and monitor continuously if you independently decide to proceed.
+Keep real trading disabled unless you independently decide the broker, strategy, execution, and risk settings have passed validation. A live opt-in does not make the strategy profitable or safe. Start with minimum size and continuous monitoring.

@@ -1,40 +1,51 @@
 # MT5 Forex Robot
 
-An experimental MetaTrader 5 Expert Advisor implementing a simple EMA-trend pullback entry with ATR-based exits and conservative, persistent risk limits. It is not a profit guarantee and has **not** been compiled or validated in MetaTrader here.
+A conservative MetaTrader 5 EMA pullback Expert Advisor. It is an experimental strategy: **it has not been compiled or backtested in MetaTrader from this repository authoring environment**.
 
 ## Strategy
 
-- Trend: 50 EMA above/below 200 EMA.
-- Entry: a completed candle pulls back to the fast EMA, followed by a completed candle closing back on the trend side.
-- Stop and target: ATR multiples (defaults 2x and 3x).
-- One position per symbol; no martingale, grid, averaging down, or recovery logic.
-- Signals use completed bars; the EA evaluates once per new bar for each configured symbol.
+- 50 EMA and 200 EMA determine trend direction.
+- A completed candle pulls back to the fast EMA.
+- The candle then closes back on the trend side.
+- Entry occurs only on the new completed-bar boundary.
+- ATR determines stop and target distances.
+- Default reward-to-risk is 3 ATR / 2 ATR.
+- No martingale, averaging, grid, recovery, or pyramid logic.
 
-## Universe and timeframe
+## Universe
 
-- Default scans the explicitly entered broker symbol names on the chart timeframe (`PERIOD_CURRENT`). Change names for broker suffixes (for example, `.m`) as shown in Market Watch.
-- `InpMarketWatchSymbols=true` scans symbols currently visible in Market Watch; it does not mean every instrument the broker offers.
-- To use a different timeframe, set `InpTimeframe`. A single EA instance uses one timeframe.
-- Multiple instances can duplicate signals. The shared magic number and one-position-per-symbol check reduce duplicates, but configure and validate deployments carefully.
+- Default: `EURUSD,GBPUSD,USDJPY` using the names entered in the EA.
+- `InpMarketWatchSymbols=true` scans symbols already listed in Market Watch.
+- Broker suffixes must match the exact symbols shown in MT5 Market Watch.
+- `InpTimeframe=PERIOD_CURRENT` uses the chart timeframe.
+- One EA instance processes one timeframe; attach more instances only after validating deployments.
 
-## Safety settings
+## Risk safeguards
 
-- Real-account entries are blocked unless `InpAllowLiveTrading=true`.
-- Default per-trade risk: 0.25% equity; accepted input is capped at 1%.
-- Daily loss lock: 1%, persisted across terminal restarts until the next broker-server day.
-- Equity high-water mark persists in MT5 Global Variables; max drawdown default is 5% and blocks new entries.
-- Maximum three EA positions, 30-point spread filter, and 5-lot hard cap by default.
-- Position size is calculated from broker profit calculation at the proposed stop. If minimum lot size exceeds the risk budget, no order is sent.
-- Existing positions on a symbol (including manual positions) prevent a new EA order on that symbol.
+- Real-account trading blocked by default (`InpAllowLiveTrading=false`).
+- 0.25% default equity risk per trade; input validation limits this to 1%.
+- 1% daily loss lock persisted through terminal restarts.
+- 5% equity drawdown lock using a persisted terminal high-water mark.
+- Maximum of three EA positions by magic number.
+- Maximum spread and 5-lot hard caps.
+- `OrderCalcProfit`-based position sizing and broker volume-step normalization.
+- Existing positions on a symbol prevent a new EA entry on that symbol.
 
-Risk locks prevent new entries; they do not automatically close open positions. Emergency stop/close procedures remain the trader's responsibility. Gaps, slippage, execution failures, and correlated exposure can exceed planned risk.
+Risk locks stop new entries. They do not close open positions. Gaps, slippage, rejected orders, disconnections, commission, swap, and correlated exposure can exceed planned risk.
 
-## Install
+## Installation
 
-1. In MT5 choose **File → Open Data Folder**.
-2. Copy `src/FBK_MultiTimeframe_EA.mq5` to `MQL5/Experts/`.
-3. Open it in MetaEditor and compile. Resolve any broker/build-specific issues before testing.
-4. Run Strategy Tester with realistic spread, commission, swaps, and tick data.
-5. Forward-test on demo before considering live use. Keep `InpAllowLiveTrading=false` until independent validation is complete.
+1. Copy `src/FBK_MultiTimeframe_EA.mq5` to `MQL5/Experts/` in MT5.
+2. Compile it in MetaEditor and resolve every error or warning.
+3. Attach it to a chart and enable Algo Trading.
+4. Test exact broker symbols and timeframe in Strategy Tester.
+5. Forward-test on demo for at least 30–60 calendar days.
+6. Never enable `InpAllowLiveTrading=true` until independent validation is complete.
 
-The repository authoring environment cannot run MetaEditor, so compilation and backtest results are not claimed. Forex/CFD trading can lose money; this software is educational and experimental.
+## Repository files
+
+- `src/FBK_MultiTimeframe_EA.mq5`
+- `docs/TESTING.md`
+- `docs/RISK_CONTROLS.md`
+
+Forex and CFD trading can lose capital rapidly. No automated trading software guarantees profit or capital preservation.
